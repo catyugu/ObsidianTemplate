@@ -1,6 +1,6 @@
 ---
 constraints:
-  abandon_emoji: false
+    abandon_emoji: false
 ---
 
 # ideas

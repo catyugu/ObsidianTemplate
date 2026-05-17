@@ -1,9 +1,9 @@
 ---
 constraints:
-  max_file_count: 20
-  abandon_emoji: true
-  require_index: true
-  check_index_coverage: true
+    max_file_count: 20
+    abandon_emoji: true
+    require_index: true
+    check_index_coverage: true
 ---
 
 # ObsidianTemplate
