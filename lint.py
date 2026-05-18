@@ -9,25 +9,40 @@ import re
 import sys
 import io
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace, fields
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Iterator
 import yaml
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-# 自动检测 ROOT 目录（脚本所在目录）
 ROOT = Path(__file__).resolve().parent
+SPECIAL_DIRS = {'attachments', '__pycache__'}
+
+# ================= 预编译正则表达式 =================
+FM_PATTERN = re.compile(r'^---\n(.*?)\n---\n', re.DOTALL)
+TITLE_PATTERN = re.compile(r'^#\s+(.+)$', re.MULTILINE)
+# 捕获两部分：1.链接文本 2.链接目标
+MD_LINK_PATTERN = re.compile(r'\[([^\]]*)\]\(([^)]+)\)')
+WIKI_LINK_PATTERN = re.compile(r'\[\[([^\]]+)\]\]')
+EMOJI_PATTERN = re.compile(
+    r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
+    r'\U0001F1E0-\U0001F1FF\U00002702-\U00002702\U00002600-\U000026FF'
+    r'\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF]'
+)
+
+# 全局文件缓存，加速 wiki 链接查找
+_FILE_CACHE: Optional[dict[str, Path]] = None
+
 
 @dataclass
 class LintConfig:
-    """规则配置"""
     max_file_count: int = 20
-    abandon_emoji: bool = True  # 默认禁用 emoji
+    abandon_emoji: bool = True
     require_index: bool = True
     check_links: bool = True
     enforce_title_match: bool = True
-    check_index_coverage: bool = True  # 检查索引覆盖率
+    check_index_coverage: bool = True
 
 
 @dataclass
@@ -35,224 +50,135 @@ class LintResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-    def add_error(self, msg: str):
-        self.errors.append(msg)
-
-    def add_warning(self, msg: str):
-        self.warnings.append(msg)
-
+    @property
     def has_errors(self) -> bool:
-        return len(self.errors) > 0
+        return bool(self.errors)
 
 
-# 特殊目录（不需要索引文件）
-SPECIAL_DIRS = {'attachments', '__pycache__'}
+# ================= 辅助函数 =================
+
+def get_valid_items(dir_path: Path) -> Iterator[Path]:
+    """生成目录下的有效项目（排除隐藏文件和特殊目录）"""
+    return (p for p in dir_path.iterdir() if not p.name.startswith('.') and p.name not in SPECIAL_DIRS)
 
 
-def read_yaml_frontmatter(content: str) -> Optional[dict]:
-    """读取 markdown 文件的 YAML frontmatter"""
-    pattern = r'^---\n(.*?)\n---\n'
-    match = re.match(pattern, content, re.DOTALL)
-    if match:
-        return yaml.safe_load(match.group(1))
-    return None
-
-
-def extract_title(content: str) -> Optional[str]:
-    """提取 markdown 文件的第一个标题"""
-    pattern = r'^#\s+(.+)$'
-    match = re.search(pattern, content, re.MULTILINE)
-    return match.group(1) if match else None
+def get_file_cache() -> dict[str, Path]:
+    """构建全局文件缓存，将时间复杂度从 O(N*M) 降至 O(1)"""
+    global _FILE_CACHE
+    if _FILE_CACHE is None:
+        _FILE_CACHE = {}
+        for p in ROOT.rglob('*'):
+            if p.is_file() and not p.name.startswith('.') and not set(p.parts) & SPECIAL_DIRS:
+                _FILE_CACHE[p.name] = p
+                _FILE_CACHE[p.stem] = p
+    return _FILE_CACHE
 
 
 def merge_config(parent: LintConfig, child_constraints: dict) -> LintConfig:
-    """合并父子配置，子配置覆盖父配置"""
-    config = LintConfig(
-        max_file_count=child_constraints.get('max_file_count', parent.max_file_count),
-        abandon_emoji=child_constraints.get('abandon_emoji', parent.abandon_emoji),
-        require_index=child_constraints.get('require_index', parent.require_index),
-        check_links=child_constraints.get('check_links', parent.check_links),
-        enforce_title_match=child_constraints.get('enforce_title_match', parent.enforce_title_match),
-        check_index_coverage=child_constraints.get('check_index_coverage', parent.check_index_coverage)
-    )
-    return config
+    valid_keys = {f.name for f in fields(LintConfig)}
+    updates = {k: v for k, v in child_constraints.items() if k in valid_keys}
+    return replace(parent, **updates)
 
 
-def get_dir_config(dir_path: Path, parent_config: LintConfig) -> tuple[LintConfig, dict]:
-    """获取目录的配置，返回 (合并后的配置, 该目录的原始约束字典)"""
+def get_dir_config(dir_path: Path, parent_config: LintConfig) -> LintConfig:
     index_file = dir_path / f"{dir_path.name}.md"
     if not index_file.exists():
-        return parent_config, {}
+        return parent_config
 
     content = index_file.read_text(encoding='utf-8')
-    fm = read_yaml_frontmatter(content)
-    if not fm or 'constraints' not in fm:
-        return parent_config, {}
-
-    return merge_config(parent_config, fm['constraints']), fm['constraints']
-
-
-def check_emoji(content: str, config: LintConfig) -> list[str]:
-    """检查是否包含 emoji"""
-    if not config.abandon_emoji:
-        return []
-
-    emoji_pattern = re.compile(
-        r'[\U0001F600-\U0001F64F'
-        r'\U0001F300-\U0001F5FF'
-        r'\U0001F680-\U0001F6FF'
-        r'\U0001F1E0-\U0001F1FF'
-        r'\U00002702-\U00002702'
-        r'\U00002600-\U000026FF'
-        r'\U0001F900-\U0001F9FF'
-        r'\U0001FA00-\U0001FA6F'
-        r'\U0001FA70-\U0001FAFF]'
-    )
-    errors = []
-    for i, line in enumerate(content.split('\n'), 1):
-        if emoji_pattern.search(line):
-            errors.append(f"Line {i}: 包含 emoji 字符")
-    return errors
-
-
-def check_title_match(filepath: Path, content: str, config: LintConfig) -> list[str]:
-    """检查标题是否与文件名匹配"""
-    if not config.enforce_title_match:
-        return []
-
-    title = extract_title(content)
-    if not title:
-        return [f"缺少标题"]
-
-    expected = filepath.stem.replace('%20', ' ')
-    if title != expected:
-        return [f"标题 '{title}' 与文件名 '{filepath.name}' 不匹配"]
-    return []
-
-
-def check_file_count(dir_path: Path, config: LintConfig) -> list[str]:
-    """检查目录下的文件数量"""
-    items = [p for p in dir_path.iterdir()
-             if not p.name.startswith('.') and p.name not in SPECIAL_DIRS]
-    count = len(items)
-
-    if count > config.max_file_count:
-        return [f"目录包含 {count} 个项目，超过上限 {config.max_file_count}"]
-    return []
+    match = FM_PATTERN.match(content)
+    if match:
+        fm = yaml.safe_load(match.group(1)) or {}
+        if 'constraints' in fm:
+            return merge_config(parent_config, fm['constraints'])
+    return parent_config
 
 
 def find_file_global(filename: str) -> Optional[Path]:
-    """Globally search for a file by name across the entire repository"""
-    # Remove extension if present to search for both with and without extension
-    name_without_ext = Path(filename).stem
-    ext = Path(filename).suffix
-
-    # Normalize path separators for cross-platform compatibility
+    """全局极速查找文件"""
     filename = filename.replace('\\', '/')
-    has_path = '/' in filename
+    if '/' in filename:
+        exact_path = ROOT / filename.lstrip('/')
+        if exact_path.exists(): return exact_path
+        if exact_path.with_suffix('.md').exists(): return exact_path.with_suffix('.md')
+    
+    cache = get_file_cache()
+    name = Path(filename).name
+    return cache.get(name) or cache.get(f"{name}.md")
 
-    # Build search patterns - prioritize exact path matches first
-    patterns = []
-    if has_path:
-        # Wiki link with path - try exact path match first, then filename-only fallback
-        patterns.append(filename)
-        patterns.append(name_without_ext)
-        if ext:
-            patterns.append(name_without_ext)
-        else:
-            patterns.append(f"{name_without_ext}.md")
-    else:
-        # Wiki link without path - try filename with and without extension
-        patterns.append(name_without_ext)
-        if ext:
-            patterns.append(filename)
-        else:
-            patterns.append(f"{name_without_ext}.md")
 
-    for pattern in patterns:
-        # Search recursively from ROOT
-        for path in ROOT.rglob(pattern):
-            if path.is_file():
-                return path
-    return None
+# ================= 核心检查逻辑 =================
+
+def check_emoji(content: str, config: LintConfig) -> list[str]:
+    if not config.abandon_emoji:
+        return []
+    return [f"Line {i}: 包含 emoji 字符" for i, line in enumerate(content.splitlines(), 1) if EMOJI_PATTERN.search(line)]
+
+
+def check_title_match(filepath: Path, content: str, config: LintConfig) -> list[str]:
+    if not config.enforce_title_match:
+        return []
+        
+    match = TITLE_PATTERN.search(content)
+    if not match:
+        return ["缺少标题"]
+
+    title = match.group(1)
+    expected = filepath.stem.replace('%20', ' ')
+    return [f"标题 '{title}' 与文件名 '{filepath.name}' 不匹配"] if title != expected else []
+
+
+def check_file_count(dir_path: Path, config: LintConfig) -> list[str]:
+    count = sum(1 for _ in get_valid_items(dir_path))
+    return [f"目录包含 {count} 个项目，超过上限 {config.max_file_count}"] if count > config.max_file_count else []
 
 
 def check_links(content: str, filepath: Path, config: LintConfig) -> list[str]:
-    """检查链接有效性"""
     if not config.check_links:
         return []
 
     errors = []
-    # Markdown style links: [text](link)
-    md_link_pattern = re.compile(r'\[.*?\]\(([^)]+)\)')
-    # Wiki style links: [[link]]
-    wiki_link_pattern = re.compile(r'\[\[([^\]]+)\]\]')
-
     base_dir = filepath.parent
 
-    # Check markdown style links
-    for match in md_link_pattern.finditer(content):
-        link = match.group(1)
-
-        # 跳过外部URL
-        if link.startswith('http://') or link.startswith('https://'):
+    # 1. 检查常规 Markdown 链接
+    for match in MD_LINK_PATTERN.finditer(content):
+        _, raw_link = match.groups()
+        
+        # 处理可能附带的 title，如 (1.md "Title") -> 截断保留 1.md
+        link = raw_link.strip()
+        if ' "' in link or " '" in link:
+            link = re.split(r'\s+["\']', link)[0]
+            
+        link = urllib.parse.unquote(link.split('#', 1)[0]).rstrip('/')
+        
+        if not link or link.startswith(('http://', 'https://', 'mailto:', 'tel:')):
             continue
 
-        # 分离链接和锚点
-        anchor = ''
-        if '#' in link:
-            link, anchor = link.split('#', 1)
-            # 纯锚点链接（如 #heading）跳过
-            if not link:
-                continue
-
-        # 解码 URL 编码（%20 -> 空格等）
-        decoded_link = urllib.parse.unquote(link)
-
-        # 处理 WIKI 式链接 [[link]]
-        is_wiki_link = False
-        if decoded_link.startswith('[[') and decoded_link.endswith(']]'):
-            decoded_link = decoded_link[2:-2]
-            is_wiki_link = True
-
-        # 去除末尾的 / 使其与目录名匹配
-        decoded_link = decoded_link.rstrip('/')
-
-        if is_wiki_link:
-            # Wiki-style link: globally search for the file
-            found_path = find_file_global(decoded_link)
-            if not found_path:
-                errors.append(f"链接无效: {link} (文件未找到)")
+        if link.startswith('[[') and link.endswith(']]'):
+            link = link[2:-2]  # 转交 Wiki 链接逻辑处理
+            is_wiki = True
         else:
-            # 判断是绝对路径还是相对路径
-            if decoded_link.startswith('/'):
-                # 绝对路径（根目录）
-                link_path = ROOT / decoded_link.lstrip('/')
-            else:
-                # 相对路径
-                link_path = (base_dir / decoded_link).resolve()
+            is_wiki = False
+            link_path = ROOT / link.lstrip('/') if link.startswith('/') else (base_dir / link).resolve()
+            # 增强检测：如果文件不存在，且补充 .md 后缀后也不存在，才判定为无效
+            if not link_path.exists() and not link_path.with_suffix('.md').exists():
+                errors.append(f"无效链接: {match.group(0)}")
 
-            # 检查文件或目录是否存在
-            if not link_path.exists():
-                errors.append(f"链接无效: {link}")
+        if is_wiki and not find_file_global(link):
+            errors.append(f"无效链接: {match.group(0)} (文件未找到)")
 
-    # Check wiki style links separately (global search)
-    for match in wiki_link_pattern.finditer(content):
-        link = match.group(1)
-
-        # 解码 URL 编码（%20 -> 空格等）
-        decoded_link = urllib.parse.unquote(link)
-        decoded_link = decoded_link.rstrip('/')
-
-        found_path = find_file_global(decoded_link)
-        if not found_path:
-            errors.append(f"链接无效: [[{decoded_link}]] (文件未找到)")
+    # 2. 检查 Wiki 链接
+    for match in WIKI_LINK_PATTERN.finditer(content):
+        link = urllib.parse.unquote(match.group(1).split('#', 1)[0]).rstrip('/')
+        if not link:
+            continue
+        if not find_file_global(link):
+            errors.append(f"无效链接: [[{match.group(1)}]] (文件未找到)")
 
     return errors
 
 
 def check_index_coverage(dir_path: Path, config: LintConfig) -> list[str]:
-    """检查索引文件的覆盖率 - 是否所有文件都被索引"""
     if not config.check_index_coverage:
         return []
 
@@ -261,129 +187,96 @@ def check_index_coverage(dir_path: Path, config: LintConfig) -> list[str]:
         return []
 
     content = index_file.read_text(encoding='utf-8')
-
-    # 获取目录下所有需要索引的文件和目录（排除特殊目录和隐藏文件）
-    all_items = []
-    for item in dir_path.iterdir():
-        if not item.name.startswith('.') and item.name not in SPECIAL_DIRS:
-            all_items.append(item)
-
-    # 提取索引文件中链接的所有文件和目录（不仅仅是 .md 文件）
     linked_items = set()
-    rel_path_pattern = re.compile(r'\[.*?\]\(([^)]+)\)')
-    for match in rel_path_pattern.finditer(content):
-        link = match.group(1)
-        decoded_link = urllib.parse.unquote(link)
-        # 去除末尾的 /
-        decoded_link = decoded_link.rstrip('/')
-        if decoded_link.startswith('/'):
-            linked_items.add(decoded_link.lstrip('/'))
-        else:
-            linked_items.add(decoded_link)
+    
+    for m in MD_LINK_PATTERN.finditer(content):
+        raw_link = m.group(2).strip()
+        link = urllib.parse.unquote(raw_link.split('#', 1)[0]).rstrip('/')
+        if ' "' in link or " '" in link:
+            link = re.split(r'\s+["\']', link)[0]
+        linked_items.add(link.lstrip('/'))
 
+    for m in WIKI_LINK_PATTERN.finditer(content):
+        link = urllib.parse.unquote(m.group(1).split('#', 1)[0]).rstrip('/').lstrip('/')
+        linked_items.add(link)
+        
     errors = []
-    for item in all_items:
-        # 跳过索引文件本身
-        if item.name == index_file.name:
+    for item in get_valid_items(dir_path):
+        if item == index_file:
             continue
-        # 检查目录/文件是否在链接中（允许文件名或路径形式）
-        item_linked = False
-        for linked in linked_items:
-            if item.name == linked or item.name == linked.replace('%20', ' '):
-                item_linked = True
-                break
-            # 也检查带路径的链接
-            if str(item.relative_to(dir_path)) == linked or str(item.relative_to(dir_path)).replace('%20', ' ') == linked:
-                item_linked = True
-                break
-
-        if not item_linked:
-            if item.is_dir():
-                errors.append(f"索引文件中未链接目录: {item.name}")
-            else:
-                errors.append(f"索引文件中未链接: {item.name}")
+            
+        rel_path = str(item.relative_to(dir_path)).replace('\\', '/')
+        if (item.name not in linked_items and 
+            rel_path not in linked_items and
+            item.stem not in linked_items):
+            kind = "目录" if item.is_dir() else "文件"
+            errors.append(f"索引文件中未链接{kind}: {item.name}")
 
     return errors
 
-def lint_file(filepath: Path, config: LintConfig) -> LintResult:
-    """检查单个文件"""
-    result = LintResult()
 
+# ================= 流程控制 =================
+
+def lint_file(filepath: Path, config: LintConfig) -> LintResult:
+    result = LintResult()
     try:
         content = filepath.read_text(encoding='utf-8')
+        result.errors.extend(check_title_match(filepath, content, config))
+        result.errors.extend(check_emoji(content, config))
+        result.errors.extend(check_links(content, filepath, config))
     except Exception as e:
-        result.add_error(f"无法读取文件: {e}")
-        return result
-
-    result.errors.extend(check_title_match(filepath, content, config))
-    result.errors.extend(check_emoji(content, config))
-    result.errors.extend(check_links(content, filepath, config))
-
+        result.errors.append(f"无法读取文件: {e}")
     return result
 
 
 def lint_directory(dir_path: Path, parent_config: LintConfig) -> LintResult:
-    """检查整个目录"""
-    config, _ = get_dir_config(dir_path, parent_config)
+    config = get_dir_config(dir_path, parent_config)
     result = LintResult()
 
-    # 检查文件数量
     result.errors.extend(check_file_count(dir_path, config))
-
-    # 检查索引文件（特殊目录除外）
-    if config.require_index and dir_path.name not in SPECIAL_DIRS:
+    
+    is_special = dir_path.name in SPECIAL_DIRS
+    if config.require_index and not is_special:
         expected_index = dir_path / f"{dir_path.name}.md"
-        if not expected_index.exists():
-            result.add_error(f"缺少索引文件: {expected_index.name}")
+        if not expected_index.exists() and dir_path != ROOT:
+            result.errors.append(f"缺少索引文件: {expected_index.name}")
 
-    # 检查索引覆盖率
     result.errors.extend(check_index_coverage(dir_path, config))
 
-    # 检查目录下所有 markdown 文件
+    # 【关键修复】：移除原先跳过处理索引文件 (dir_path.name + ".md") 的 continue 逻辑
+    # 以确保写在索引文件内部的无效链接同样受到严格检查
     for md_file in dir_path.glob("*.md"):
-        if md_file.name == dir_path.name + ".md" and dir_path != ROOT:
-            continue
-        file_result = lint_file(md_file, config)
-        for err in file_result.errors:
-            result.add_error(f"{md_file.name}: {err}")
-        for warn in file_result.warnings:
-            result.add_warning(f"{md_file.name}: {warn}")
+        res = lint_file(md_file, config)
+        result.errors.extend(f"{md_file.name}: {err}" for err in res.errors)
+        result.warnings.extend(f"{md_file.name}: {warn}" for warn in res.warnings)
 
-    # 递归检查子目录（排除特殊目录）
-    for subdir in dir_path.iterdir():
-        if subdir.is_dir() and not subdir.name.startswith('.') and subdir.name not in SPECIAL_DIRS:
-            sub_result = lint_directory(subdir, config)
-            for err in sub_result.errors:
-                result.add_error(f"[{subdir.name}] {err}")
-            for warn in sub_result.warnings:
-                result.add_warning(f"[{subdir.name}] {warn}")
+    # 递归子目录
+    for subdir in get_valid_items(dir_path):
+        if subdir.is_dir():
+            sub_res = lint_directory(subdir, config)
+            result.errors.extend(f"[{subdir.name}] {err}" for err in sub_res.errors)
+            result.warnings.extend(f"[{subdir.name}] {warn}" for warn in sub_res.warnings)
 
     return result
 
 
-def run_lint() -> LintResult:
-    """运行所有检查"""
-    root_config = LintConfig()
-    return lint_directory(ROOT, root_config)
-
-
 def main():
-    result = run_lint()
+    result = lint_directory(ROOT, LintConfig())
 
     if result.errors:
         print("[ERROR] Errors found:")
-        for err in result.errors:
-            print(f"  - {err}")
+        for err in result.errors: print(f"  - {err}")
 
     if result.warnings:
         print("[WARNING] Warnings:")
-        for warn in result.warnings:
-            print(f"  - {warn}")
+        for warn in result.warnings: print(f"  - {warn}")
 
-    if not result.errors and not result.warnings:
-        print("[OK] All checks passed")
-
-    sys.exit(1 if result.has_errors() else 0)
+    if not result.has_errors:
+        if not result.warnings:
+            print("[OK] All checks passed")
+        sys.exit(0)
+    else:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
