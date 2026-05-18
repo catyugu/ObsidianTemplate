@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Linter - 自动检查笔记仓库的规则遵守情况
 所有配置从索引文件的 YAML frontmatter 中读取
@@ -6,11 +7,14 @@ Linter - 自动检查笔记仓库的规则遵守情况
 
 import re
 import sys
+import io
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import yaml
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # 自动检测 ROOT 目录（脚本所在目录）
 ROOT = Path(__file__).resolve().parent
